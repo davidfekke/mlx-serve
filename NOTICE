@@ -697,3 +697,11 @@ and they are listed because they made that work possible.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. mlx-serve does not redistribute them.
+
+  * multimodal-art-projection/YuE (Apache-2.0), which defines the YuE2 AR–NAR music
+    generation pipeline (protocol, tokenization, NAR/AR, sampling, decoder and
+    tiled VAE decode) — served here as `src/yue2.zig` (AR decoding + CFG handling,
+    cached NAR + midpoint ODE, exact-boundary tiled YuE2-VAE decoder, quant/rope/
+    geometry as audited against the reference), with support for cot/off/melody/full
+    and optional ABC notation. Weights are the original model weights (CC BY-NC 4.0);
+    the code port respects the reference's numerics and contracts.

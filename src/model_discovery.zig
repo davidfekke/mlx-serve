@@ -87,6 +87,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     // Stable Audio 3: same, for its T5Gemma subdir.
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
+    // YuE2: the converter writes the VAE last of the pack's files.
+    if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
     return null;
 }
 
@@ -102,6 +104,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
@@ -602,6 +605,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
@@ -1415,6 +1419,12 @@ test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
     try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "yue2 classifies as audio media with the vae marker" {
+    try testing.expect(isMediaModelType("yue2"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("yue2"));
+    try testing.expectEqualStrings("vae.safetensors", requiredMediaMarker("yue2").?);
 }
 
 test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {

@@ -23,6 +23,7 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const yue2 = @import("yue2.zig");
 const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
@@ -106,6 +107,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "stable_audio3",
+    "yue2",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -116,6 +118,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
+    if (std.mem.eql(u8, model_type, "yue2")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -153,6 +156,7 @@ pub const GenRoute = enum {
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
+    if (std.mem.eql(u8, model_type, "yue2")) return .yue2;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
@@ -167,6 +171,9 @@ pub const AudioBackendKind = enum {
     tts,
     music,
     music3,
+    /// YuE2 (M-A-P): AR–NAR Mixture-of-Transformers songs on the shared
+    /// music route.
+    yue2,
     kokoro,
     /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
     sound,
@@ -174,7 +181,7 @@ pub const AudioBackendKind = enum {
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
     pub fn servesMusic(self: AudioBackendKind) bool {
-        return self == .music or self == .music3;
+        return self == .music or self == .music3 or self == .yue2;
     }
 };
 
@@ -889,6 +896,7 @@ pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
     music3: *music3.Engine,
+    yue2: *yue2.Engine,
     kokoro: *kokoro.Engine,
     sound: *stable_audio.Engine,
 };
@@ -916,6 +924,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .yue2) {
+            self.backend = .{ .yue2 = try yue2.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] YuE2 music engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .sound) {
             self.backend = .{ .sound = try stable_audio.Engine.load(io, allocator, model_dir) };
             log.info("[audio] Stable Audio 3 engine ready\n", .{});
@@ -938,6 +951,7 @@ pub const AudioEngine = struct {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
+            .yue2 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
             .sound => |e| e.deinit(),
         }
@@ -2866,6 +2880,7 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
+        .yue2 => |m| return handleMusicYue2(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
@@ -4824,6 +4839,16 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         if (sum == 0) return 0; // unknown dir -> never block
         return sum + MUSIC3_GEN_BUFFER_BYTES;
     }
+    if (std.mem.eql(u8, model_type, "minimax_music3")) {
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0;
+        return sum + MUSIC3_GEN_BUFFER_BYTES;
+    }
+    if (std.mem.eql(u8, model_type, "yue2")) {
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0;
+        return sum + 512 * 1024 * 1024;
+    }
     if (std.mem.eql(u8, model_type, "AudioVideo")) {
         // Both variants ship; only one is ever loaded. Subtract the smaller so
         // an asymmetric future pack still bills its larger one.
@@ -5301,6 +5326,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
     try testing.expectEqual(Modality.audio, modalityFromType("acestep").?);
     try testing.expectEqual(Modality.audio, modalityFromType("minimax_music3").?);
+    try testing.expectEqual(Modality.audio, modalityFromType("yue2").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
@@ -5631,12 +5657,14 @@ test "GenRoute: speech + music share the audio modality slot" {
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
     try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
+    try testing.expect(audioBackendKindForType("yue2") == .yue2);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
     // Both music engines serve /v1/audio/music-generations and advertise the
     // "music" capability; TTS backends never do.
     try testing.expect(AudioBackendKind.music.servesMusic());
     try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(AudioBackendKind.yue2.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
@@ -5654,11 +5682,11 @@ test "stable_audio3 is a sound backend on its own route, with named bounds" {
     try testing.expectEqual(SoundParams{ .seconds = 15, .steps = 8 }, parseSoundParams(a, "{\"duration_seconds\":1.5e1,\"steps\":8.0}").ok);
     // Every field the endpoint cannot honor is a 400 naming it, never a silent default.
     const bad = [_][2][]const u8{
-        .{ "{\"duration_seconds\":0}", "duration_seconds" },   .{ "{\"duration_seconds\":121}", "duration_seconds" },
+        .{ "{\"duration_seconds\":0}", "duration_seconds" },      .{ "{\"duration_seconds\":121}", "duration_seconds" },
         .{ "{\"duration_seconds\":\"10\"}", "duration_seconds" }, .{ "{\"steps\":0}", "steps" },
-        .{ "{\"steps\":51}", "steps" },                     .{ "{\"steps\":-5}", "steps" },
-        .{ "{\"steps\":4.9}", "steps" },                    .{ "{\"seed\":-1}", "seed" },
-        .{ "{\"seed\":\"x\"}", "seed" },                    .{ "not json", "JSON" },
+        .{ "{\"steps\":51}", "steps" },                           .{ "{\"steps\":-5}", "steps" },
+        .{ "{\"steps\":4.9}", "steps" },                          .{ "{\"seed\":-1}", "seed" },
+        .{ "{\"seed\":\"x\"}", "seed" },                          .{ "not json", "JSON" },
     };
     for (bad) |c| {
         const msg = parseSoundParams(a, c[0]).bad;
@@ -6578,6 +6606,8 @@ test "media markers are per-TYPE, not per-modality" {
     // Music3: the converter writes the vocoder LAST, so its presence is the
     // completeness marker for the whole five-file pack.
     try std.testing.expectEqualStrings("vocoder.safetensors", requiredMarkerFor("minimax_music3").?);
+    // YuE2: same rule — the converter writes the VAE last.
+    try std.testing.expectEqualStrings("vae.safetensors", requiredMarkerFor("yue2").?);
     // H3 must NOT be gated on LTX's file.
     try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
 
@@ -6693,4 +6723,64 @@ test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
     const gb: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
     try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
+}
+
+fn handleMusicYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m: *yue2.Engine) !void {
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    var lyrics: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(lyrics);
+    if (extractJsonString(body, "lyrics")) |raw| {
+        allocator.free(lyrics);
+        lyrics = try jsonUnescape(allocator, raw);
+    }
+
+    const instrumental_raw = sse.bodyWantsTrue(body, "instrumental") orelse (lyrics.len == 0);
+    if (instrumentalConflicts(instrumental_raw, lyrics)) return sendError(conn, 400, "instrumental=true conflicts with provided lyrics");
+
+    var seed: u64 = 0;
+    if (extractJsonInt(body, "seed")) |s| seed = @intCast(@as(i64, @intCast(s)) ^ 0x123456789abcdef0);
+
+    const duration = extractJsonFloat(body, "duration_seconds") orelse 60.0;
+    if (duration < 10.0 or duration > 600.0) return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
+
+    const stream_flag = sse.bodyWantsTrue(body, "stream");
+
+    const cot = yue2.parseCot(extractJsonString(body, "cot")) orelse yue2.Cot.melody;
+    if (extractJsonString(body, "abc_notation")) |raw_abc| {
+        const abc = try jsonUnescape(allocator, raw_abc);
+        defer allocator.free(abc);
+        const req = yue2.MusicRequest{
+            .prompt = prompt,
+            .lyrics = lyrics,
+            .instrumental = instrumental_raw,
+            .cot = cot,
+            .abc = abc,
+            .duration_seconds = duration,
+            .seed = seed,
+            .stream = stream_flag,
+        };
+        return generateYue2(allocator, conn, m, req);
+    }
+
+    const req = yue2.MusicRequest{
+        .prompt = prompt,
+        .lyrics = lyrics,
+        .instrumental = instrumental_raw,
+        .cot = cot,
+        .abc = null,
+        .duration_seconds = duration,
+        .seed = seed,
+        .stream = stream_flag,
+    };
+    return generateYue2(allocator, conn, m, req);
+}
+
+fn generateYue2(allocator: std.mem.Allocator, conn: *Conn, m: *yue2.Engine, req: yue2.MusicRequest) !void {
+    const wav = try m.generate(allocator, req, null);
+    defer allocator.free(wav);
+    return sendBytes(conn, allocator, "audio/wav", wav);
 }

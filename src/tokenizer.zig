@@ -324,6 +324,14 @@ pub const Tokenizer = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    /// `encode_ordinary` (tiktoken semantics): no special-token parsing —
+    /// text matching a special string encodes as plain bytes. YuE2's prompt
+    /// path (style/lyrics/ABC); specials ride the prompt only as explicit ids.
+    pub fn encodeOrdinary(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        if (self.tok_type == .wordpiece) return self.encodeWordPiece(allocator, text);
+        return self.encodeSegment(allocator, text, true);
+    }
+
     /// Encode a text segment (no special tokens) using the appropriate method.
     fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, at_start: bool) ![]u32 {
         return switch (self.tok_type) {
@@ -1405,11 +1413,139 @@ fn appendJsonEscapedTok(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     };
 }
 
-/// Try the fast `tokenizer.json` format, falling back to slow vocab.json+merges.txt.
+/// qwen.tiktoken's ordinary-token count (the checkpoint-native rank span;
+/// tokenization_yue2.py asserts the same number).
+pub const TIKTOKEN_QWEN_RANKS: usize = 151643;
+
+/// Load a byte-level BPE tokenizer from the tiktoken format — one
+/// `<base64> <rank>` line file (`qwen.tiktoken`; YuE2). A rank IS the token
+/// id and tiktoken merges by lowest CONCATENATION rank, so EVERY aligned
+/// split of every multi-byte token is emitted as a merge pair, in rank
+/// order — reproducing `byte_pair_merge` exactly on the HF merge machinery
+/// (a canonical-splits-only table would miss the misaligned pairs tiktoken
+/// happily merges, e.g. `he|llo` → `hello`). Specials: EOD, im_start/end,
+/// R/S/X/mask/sep, `<extra_i>` with YuE2's `<abc>`/`</abc>` pinned at index
+/// 204/205. Synthesizes `tokenizer.json`-shaped content and reuses
+/// `parseTokenizerContent` (the loadTokenizerSlow ownership precedent).
+///
+/// Known gap: the reference NFC-normalizes text before encoding; std
+/// carries no Unicode normalization table. NFC-composed input — the common
+/// case — encodes identically.
+pub fn loadTokenizerTiktoken(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
+    const path = try std.fmt.allocPrint(allocator, "{s}/qwen.tiktoken", .{model_dir});
+    defer allocator.free(path);
+    const content = try readFileAllocTok(io, allocator, path);
+    defer allocator.free(content);
+    return parseTiktoken(io, allocator, content, TIKTOKEN_QWEN_RANKS);
+}
+
+fn parseTiktoken(io: std.Io, allocator: std.mem.Allocator, content: []const u8, expected_ranks: usize) !Tokenizer {
+    const Ent = struct { bytes: []u8, id: u32 };
+    var entries = std.ArrayList(Ent).empty;
+    defer {
+        for (entries.items) |e| allocator.free(e.bytes);
+        entries.deinit(allocator);
+    }
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidTiktokenFile;
+        const dec = std.base64.standard.Decoder;
+        const n = dec.calcSizeForSlice(line[0..sp]) catch return error.InvalidTiktokenFile;
+        const bytes = try allocator.alloc(u8, n);
+        errdefer allocator.free(bytes);
+        dec.decode(bytes, line[0..sp]) catch return error.InvalidTiktokenFile;
+        const id = std.fmt.parseInt(u32, std.mem.trim(u8, line[sp + 1 ..], " \t\r"), 10) catch return error.InvalidTiktokenFile;
+        try entries.append(allocator, .{ .bytes = bytes, .id = id });
+    }
+    if (entries.items.len != expected_ranks) return error.UnexpectedTiktokenVocab;
+    std.mem.sort(Ent, entries.items, {}, struct {
+        fn lessThan(_: void, a: Ent, b: Ent) bool {
+            return a.id < b.id;
+        }
+    }.lessThan);
+
+    const byte_to_unicode = buildBytesToUnicode();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"model\":{\"type\":\"BPE\",\"vocab\":{");
+    var id_tmp: [40]u8 = undefined;
+    var first = true;
+    for (entries.items) |e| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.append(allocator, '"');
+        try appendByteLevelKey(allocator, &buf, e.bytes, &byte_to_unicode);
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&id_tmp, ":{d}", .{e.id}));
+    }
+    try buf.appendSlice(allocator, "},\"merges\":[");
+    first = true;
+    for (entries.items) |e| {
+        if (e.bytes.len < 2) continue;
+        for (1..e.bytes.len) |k| {
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+            try buf.append(allocator, '"');
+            try appendByteLevelKey(allocator, &buf, e.bytes[0..k], &byte_to_unicode);
+            try buf.append(allocator, ' ');
+            try appendByteLevelKey(allocator, &buf, e.bytes[k..], &byte_to_unicode);
+            try buf.append(allocator, '"');
+        }
+    }
+    // added_tokens (ROOT level, where parseTokenizerContent reads it): 8
+    // base specials + 200 `<extra_i>` with YuE2's `<abc>`/`</abc>` pinned
+    // at index 204/205 (ids ranks+204/205 = ABC_START/ABC_END).
+    try buf.appendSlice(allocator, "]},\"added_tokens\":[");
+    const base = [_][]const u8{ "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask>", "<sep>" };
+    for (0..base.len + 200) |i| {
+        var name_buf: [24]u8 = undefined;
+        const name: []const u8 = if (i < base.len)
+            base[i]
+        else if (i == 204)
+            "<abc>"
+        else if (i == 205)
+            "</abc>"
+        else
+            try std.fmt.bufPrint(&name_buf, "<extra_{d}>", .{i - base.len});
+        if (i > 0) try buf.append(allocator, ',');
+        const id_str = try std.fmt.bufPrint(&id_tmp, "{{\"id\":{d},\"content\":\"", .{entries.items.len + i});
+        try buf.appendSlice(allocator, id_str);
+        try appendJsonEscapedTok(allocator, &buf, name);
+        try buf.appendSlice(allocator, "\",\"special\":true}");
+    }
+    try buf.appendSlice(allocator, "]}");
+    return parseTokenizerContent(io, allocator, buf.items);
+}
+
+/// One byte-level vocab key, JSON-escaped in place (keys can carry `"`/`\`
+/// — GPT-2's byte map keeps printable bytes as themselves).
+fn appendByteLevelKey(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), bytes: []const u8, table: *const [256]u21) !void {
+    var utf8_buf: [4]u8 = undefined;
+    for (bytes) |b| {
+        const len = std.unicode.utf8Encode(table[b], &utf8_buf) catch 1;
+        for (utf8_buf[0..len]) |c| switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            else => {
+                if (c < 0x20) {
+                    var tmp: [8]u8 = undefined;
+                    try buf.appendSlice(allocator, std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable);
+                } else try buf.append(allocator, c);
+            },
+        };
+    }
+}
+
+/// Try the fast `tokenizer.json` format, falling back to slow vocab.json+merges.txt, then tiktoken.
 pub fn loadTokenizerAny(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
     return loadTokenizer(io, allocator, model_dir) catch |e| {
-        if (e == error.FileNotFound) return loadTokenizerSlow(io, allocator, model_dir);
-        return e;
+        if (e != error.FileNotFound) return e;
+        return loadTokenizerSlow(io, allocator, model_dir) catch |e2| {
+            if (e2 != error.FileNotFound) return e2;
+            return loadTokenizerTiktoken(io, allocator, model_dir);
+        };
     };
 }
 
@@ -2906,3 +3042,103 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
 }
+
+/// Synthetic qwen.tiktoken: the 256 single bytes (ids 0..255) + a merge
+/// chain whose `hello` is reachable only via he|llo and whose `abcd` only
+/// via the misaligned pair (ab, cd) — a canonical-splits-only merge table
+/// (HF's) would emit [ab, cd] where tiktoken emits [abcd].
+fn synthTiktoken(allocator: std.mem.Allocator) ![]u8 {
+    var content = std.ArrayList(u8).empty;
+    errdefer content.deinit(allocator);
+    for (0..256) |b| try appendTikLine(allocator, &content, &[_]u8{@intCast(b)}, @intCast(b));
+    try appendTikLine(allocator, &content, "he", 5000);
+    try appendTikLine(allocator, &content, "ll", 5005);
+    try appendTikLine(allocator, &content, "lo", 5006);
+    try appendTikLine(allocator, &content, "llo", 5001);
+    try appendTikLine(allocator, &content, "hello", 5002);
+    try appendTikLine(allocator, &content, "ab", 5007);
+    try appendTikLine(allocator, &content, "cd", 5008);
+    try appendTikLine(allocator, &content, "abcd", 5003);
+    return content.toOwnedSlice(allocator);
+}
+
+fn appendTikLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), bytes: []const u8, id: u32) !void {
+    const enc = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    defer allocator.free(b64);
+    _ = enc.encode(b64, bytes);
+    var tmp: [16]u8 = undefined;
+    try buf.appendSlice(allocator, b64);
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&tmp, " {d}\n", .{id}) catch unreachable);
+}
+
+test "tiktoken loader: merges are concatenation-ranked, misaligned pairs included" {
+    const a = testing.allocator;
+    const content = try synthTiktoken(a);
+    defer a.free(content);
+    var tok = try parseTiktoken(std.testing.io, a, content, 264);
+    defer tok.deinit();
+
+    // hello: he(5000) merges first, ll(5005), then lo... -> llo(5001), then
+    // the (he, llo) pair — a merge only because EVERY aligned split is listed.
+    const hello = try tok.encodeOrdinary(a, "hello");
+    defer a.free(hello);
+    try testing.expectEqualSlices(u32, &.{5002}, hello);
+
+    // abcd only via the misaligned (ab, cd) pair: rank 5003 < 5007/5008.
+    const abcd = try tok.encodeOrdinary(a, "abcd");
+    defer a.free(abcd);
+    try testing.expectEqualSlices(u32, &.{5003}, abcd);
+
+    // " abcd" is ONE gpt2 pretoken (optional leading space + letters): the
+    // space byte keeps its own id ahead of the same chain.
+    const spaced = try tok.encodeOrdinary(a, "hello abcd");
+    defer a.free(spaced);
+    try testing.expectEqualSlices(u32, &.{ 5002, 32, 5003 }, spaced);
+
+    // Byte-level round-trip.
+    const back = try tok.decode(a, spaced, false);
+    defer a.free(back);
+    try testing.expectEqualStrings("hello abcd", back);
+}
+
+test "tiktoken loader: YuE2 specials — <abc>/</abc> at index 204/205, encodeOrdinary ignores them" {
+    const a = testing.allocator;
+    const content = try synthTiktoken(a);
+    defer a.free(content);
+    var tok = try parseTiktoken(std.testing.io, a, content, 264);
+    defer tok.deinit();
+
+    try testing.expectEqual(@as(?u32, 264 + 204), tok.specialTokenId("<abc>"));
+    try testing.expectEqual(@as(?u32, 264 + 205), tok.specialTokenId("</abc>"));
+    // The replaced <extra_196>/<extra_197> do not exist; the rest do —
+    // <extra_i> rides at special index 8+i (after the 8 base specials).
+    try testing.expectEqual(@as(?u32, null), tok.specialTokenId("<extra_196>"));
+    try testing.expectEqual(@as(?u32, null), tok.specialTokenId("<extra_197>"));
+    try testing.expectEqual(@as(?u32, 264 + 8 + 1), tok.specialTokenId("<extra_1>"));
+
+    // Plain encode treats specials atomically; encodeOrdinary (the YuE2
+    // prompt path) is tiktoken's encode_ordinary — plain byte pieces.
+    const enc = try tok.encode(a, "<abc>");
+    defer a.free(enc);
+    try testing.expectEqualSlices(u32, &.{264 + 204}, enc);
+    const ord = try tok.encodeOrdinary(a, "<abc>");
+    defer a.free(ord);
+    for (ord) |id| try testing.expect(id != 264 + 204);
+    const back = try tok.decode(a, ord, false);
+    defer a.free(back);
+    try testing.expectEqualStrings("<abc>", back);
+}
+
+test "tiktoken loader: rank-count and line validation" {
+    const a = testing.allocator;
+    const content = try synthTiktoken(a);
+    defer a.free(content);
+    try testing.expectError(error.UnexpectedTiktokenVocab, parseTiktoken(std.testing.io, a, content, 100));
+    // Empty content is a count mismatch (blank lines are skipped).
+    try testing.expectError(error.UnexpectedTiktokenVocab, parseTiktoken(std.testing.io, a, "", 1));
+    try testing.expectError(error.InvalidTiktokenFile, parseTiktoken(std.testing.io, a, "not-base64! 7\n", 1));
+    try testing.expectError(error.InvalidTiktokenFile, parseTiktoken(std.testing.io, a, "aGk= notanumber\n", 1));
+    try testing.expectError(error.InvalidTiktokenFile, parseTiktoken(std.testing.io, a, "aGk=\n", 1));
+}
+

@@ -1561,3 +1561,5 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Streaming generation**: SSE-based real-time token delivery.
 - **KV cache reuse**: Prompt prefix matching across requests.
 - **Sampling**: Temperature, top-p, top-k, repeat penalty.
+
+- **YuE2 music generation (experimental)**: Added native YuE2-3B support (`model_type: "yue2"`) with AR decoding, CFG, cached NAR + midpoint flow matching, exact-boundary tiled YuE2-VAE decode, and `cot` modes (off/melody/full) with optional ABC notation on `/v1/audio/music-generations`. Includes converter (`scripts/convert_yue2_weights.py`) and parity fixtures.
